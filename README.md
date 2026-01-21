@@ -4,6 +4,9 @@
 
 This repository showcases a Proof-of-Concept (POC) implementation focusing on robust, concurrent, and highly secure data ingestion into an S3-compatible Object Storage platform. The core objective is to demonstrate advanced techniques in cryptography, file streaming, asynchronous processing, and fault-tolerant logging suitable for enterprise data handling systems.
 
+<img width="1344" height="768" alt="34db481f-b066-450d-97d0-6160f01c80d2" src="https://github.com/user-attachments/assets/abe70b0f-a03c-48a9-8a3c-4b9314f0db7d" />
+
+
 ---
 
 ## 🛡️ Project Status & Technology Stack
