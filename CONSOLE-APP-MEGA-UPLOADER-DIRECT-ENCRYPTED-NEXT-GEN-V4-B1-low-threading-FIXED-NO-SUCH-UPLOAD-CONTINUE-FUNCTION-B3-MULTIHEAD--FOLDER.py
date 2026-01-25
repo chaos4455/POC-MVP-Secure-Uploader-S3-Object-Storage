@@ -55,7 +55,7 @@ TOTAL_UPLOAD_WORKERS = NUM_PROCESSES * WORKERS_PER_HEAD # 8 * 20 = 160 (Aumentad
 
 # 20 + 8 + 10 = 38
 MAX_POOL_CONNECTIONS = WORKERS_PER_HEAD + SCAN_WORKERS + 10 # Aumentado para 38
-MAX_THREADS = 120 # Aumentado para acomodar o pool local + overhead da S3 Config
+MAX_THREADS = 32 # Aumentado para acomodar o pool local + overhead da S3 Config
 
 MPU_PART_SIZE = 8 * 1024 * 1024 
 CHUNK_SIZE = MPU_PART_SIZE 
