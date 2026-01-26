@@ -1,5 +1,3 @@
-# --- START OF FILE Paste January 25, 2026 - 11:15PM (V24.0.1) ---
-
 # -*- coding: utf-8 -*-
 import os
 import sys
@@ -58,8 +56,8 @@ SMALL_UPLOAD_WORKERS = 6
 MICRO_UPLOAD_WORKERS = 15   # Dedicado ao pool SMALL
 SCAN_WORKERS = 8            # Reduzido para aliviar a disputa de I/O de disco/CPU
 
-WORKERS_PER_HEAD_LARGE = LARGE_UPLOAD_WORKERS + SMALL_UPLOAD_WORKERS # 20 Upload Workers
-WORKERS_PER_HEAD_SMALL = MICRO_UPLOAD_WORKERS + SCAN_WORKERS          # 14 Upload Workers (Micro Pool)
+WORKERS_PER_HEAD_LARGE = LARGE_UPLOAD_WORKERS + SMALL_UPLOAD_WORKERS # 28 Upload Workers
+WORKERS_PER_HEAD_SMALL = MICRO_UPLOAD_WORKERS + SCAN_WORKERS          # 23 Upload Workers (Micro Pool)
 TOTAL_UPLOAD_WORKERS = (NUM_PROCESSES_LARGE * WORKERS_PER_HEAD_LARGE) + (NUM_PROCESSES_SMALL * WORKERS_PER_HEAD_SMALL)
 
 # Max Connections: Deve acomodar todos os workers + overhead
@@ -130,7 +128,6 @@ HEAD_GROUPS = {
 
 # Mapeamento Processual (Físico) para Fila (Lógica)
 # P1-P8: Consomem Large (Q1-Q8) + Stealing de Small (Q9-Q16)
-# P9-P12: Consomem Small (Q9-Q16) + Stealing de Large (Q1-Q8)
 PROCESS_QUEUE_MAP = {
     h_id: [h_id] + HEAD_GROUPS[h_id].get('small_steal_initial', []) # Primárias (Q1..8) + Steal Inicial Small
     for h_id in range(1, NUM_PROCESSES_LARGE + 1)
@@ -1401,8 +1398,6 @@ def allocate_files_to_queues(
                 
     return []
 
-# === NOVO: Funções de Stealing e Processamento ===
-
 # Lista de todas as 16 filas lógicas
 ALL_LARGE_QUEUES = list(range(1, 8 + 1))
 ALL_SMALL_QUEUES = list(range(9, 16 + 1))
@@ -1412,6 +1407,10 @@ def get_next_target_universal_steal(
     primary_queues: List[int], 
     head_queues: Dict[int, multiprocessing.Queue]
 ) -> Optional[int]:
+    """
+    Determina a próxima fila para Pull, priorizando as filas primárias do processo,
+    e depois aplicando a lógica de Stealing baseada no foco atual do processo.
+    """
     
     # 1. Prioridade Máxima: Filas Primárias (Aggressive Pull)
     for q_id in primary_queues:
@@ -1419,14 +1418,18 @@ def get_next_target_universal_steal(
             return q_id
     
     # 2. Stealing Universal: Tenta qualquer fila não-primária (Conservative Pull)
-    # A ordem de checagem é importante: Processos Large devem priorizar Large
+    # A classificação LARGE/SMALL é baseada no foco atual determinado pela Rebalancer.
     
-    if primary_queues[0] in ALL_LARGE_QUEUES:
-        # HEAD LARGE (P1-P8): Steal de Large, depois Small
-        steal_targets = [q_id for q_id in ALL_LARGE_QUEUES if q_id not in primary_queues] + ALL_SMALL_QUEUES
+    primary_large_count = sum(1 for q_id in primary_queues if q_id in ALL_LARGE_QUEUES)
+    
+    if primary_large_count > 0:
+        # Foco em Large (ou híbrido), prioriza Large stealing, depois Small
+        all_other_large = [q_id for q_id in ALL_LARGE_QUEUES if q_id not in primary_queues]
+        steal_targets = all_other_large + ALL_SMALL_QUEUES
     else:
-        # HEAD SMALL (P9-P12): Steal de Small, depois Large
-        steal_targets = [q_id for q_id in ALL_SMALL_QUEUES if q_id not in primary_queues] + ALL_LARGE_QUEUES
+        # Foco em Small, prioriza Small stealing, depois Large
+        all_other_small = [q_id for q_id in ALL_SMALL_QUEUES if q_id not in primary_queues]
+        steal_targets = all_other_small + ALL_LARGE_QUEUES
         
     for q_id in steal_targets:
         if not head_queues[q_id].empty():
@@ -1434,13 +1437,164 @@ def get_next_target_universal_steal(
             
     return None
 
+
+# ========================================================================
+# === NOVO: PROCESSO DE REBALANCEAMENTO DINÂMICO DE FILA E MUTAÇÃO DE HEADS ===
+# ========================================================================
+
+class QueueRebalancerProcess(Process):
+    def __init__(self, head_queues: Dict[int, MPQueue], stop_event: multiprocessing.Event, global_process_assignments: Dict[int, List[int]]):
+        super().__init__()
+        self.head_queues = head_queues
+        self.stop_event = stop_event
+        self.global_process_assignments = global_process_assignments
+        
+        self.rebalance_interval = 60 # 60 segundos
+        self.OVERLOAD_THRESHOLD = 50 # Se uma fila tem mais que X itens
+        self.MIN_MOVE_COUNT = 10 # Mínimo de itens para mover
+        self.MIN_POOL_THRESHOLD = 5 # Mínimo de arquivos no pool para evitar mutação precoce
+        self.NUM_PROCESSES_LARGE = NUM_PROCESSES_LARGE
+
+    def _safe_print(self, text, style=None):
+        console = Console(theme=custom_theme)
+        prefix = f"[REBALANCER]"
+        if style:
+            console.print(f"{prefix}[{style}]{text}[/{style}]")
+        else:
+            console.print(f"{prefix}{text}")
+
+    def run(self):
+        self._safe_print("[info]Iniciando monitoramento de filas para rebalanceamento dinâmico...[/info]")
+        
+        while not self.stop_event.is_set():
+            time.sleep(self.rebalance_interval)
+            
+            if self.stop_event.is_set():
+                break
+
+            try:
+                queue_sizes = {q_id: q.qsize() for q_id, q in self.head_queues.items()}
+                total_files_remaining = sum(queue_sizes.values())
+                
+                if total_files_remaining == 0:
+                    self._safe_print("[info]Todas as filas estão vazias. Rebalancer em espera passiva.[/info]")
+                    continue
+
+                large_q_sizes = {q_id: size for q_id, size in queue_sizes.items() if q_id in ALL_LARGE_QUEUES}
+                small_q_sizes = {q_id: size for q_id, size in queue_sizes.items() if q_id in ALL_SMALL_QUEUES}
+
+                total_small_files = sum(small_q_sizes.values())
+                total_large_files = sum(large_q_sizes.values())
+                
+                # =================================================================
+                # 1. VERTICAL MIGRATION / PROCESS MUTATION (Garantir 100% de uso)
+                # =================================================================
+                
+                # Case A: Small Pool Exhausted (P9-P12 mutam para assistir Large)
+                if total_small_files < self.MIN_POOL_THRESHOLD and total_large_files > self.OVERLOAD_THRESHOLD:
+                    
+                    idle_small_processes = list(range(self.NUM_PROCESSES_LARGE + 1, NUM_TOTAL_PROCESSES + 1)) # P9-P12
+                    active_large_queues = [q_id for q_id, size in large_q_sizes.items() if size > 0]
+                    
+                    if active_large_queues:
+                        for i, p_id in enumerate(idle_small_processes):
+                            # ID de mapeamento (0 a 3)
+                            map_id = i 
+                            
+                            # Reassign P9 -> Q1, Q2 | P10 -> Q3, Q4, etc. (Circular steal)
+                            q1_idx = (map_id * 2) % len(active_large_queues)
+                            q2_idx = (map_id * 2 + 1) % len(active_large_queues)
+                            
+                            new_assignment = [active_large_queues[q1_idx], active_large_queues[q2_idx]]
+                            
+                            current_assignment = self.global_process_assignments.get(p_id)
+                            # Previne mutar se já estiver no estado de roubo do Large
+                            if current_assignment != new_assignment: 
+                                self.global_process_assignments[p_id] = new_assignment
+                                self._safe_print(f"🧬 P{p_id} MUTOU (Small Exhausted). Targets: Q{new_assignment} (Assistindo Large).", style="key")
+                                
+
+                # Case B: Large Pool Exhausted (P1-P8 mutam para assistir Small)
+                elif total_large_files < self.MIN_POOL_THRESHOLD and total_small_files > self.OVERLOAD_THRESHOLD:
+                    
+                    idle_large_processes = list(range(1, self.NUM_PROCESSES_LARGE + 1)) # P1-P8
+                    active_small_queues = [q_id for q_id, size in small_q_sizes.items() if size > 0]
+                    
+                    if active_small_queues:
+                        for i, p_id in enumerate(idle_large_processes):
+                            map_id = i
+                            
+                            # Reassign P1 -> Q9, Q10 | P2 -> Q11, Q12, etc. (Circular steal)
+                            q1_idx = (map_id * 2) % len(active_small_queues)
+                            q2_idx = (map_id * 2 + 1) % len(active_small_queues)
+
+                            new_assignment = [active_small_queues[q1_idx], active_small_queues[q2_idx]]
+                            
+                            current_assignment = self.global_process_assignments.get(p_id)
+                            # Previne mutar se já estiver no estado de roubo do Small
+                            if current_assignment != new_assignment:
+                                self.global_process_assignments[p_id] = new_assignment
+                                self._safe_print(f"🧬 P{p_id} MUTOU (Large Exhausted). Targets: Q{new_assignment} (Assistindo Small).", style="key")
+                
+                # =================================================================
+                # 2. HORIZONTAL BALANCING (Intra-Pool File Movement)
+                # =================================================================
+                
+                # Combina sobrecargas Large e Small
+                overloads = sorted(
+                    [(q_id, size, q_id in ALL_LARGE_QUEUES) for q_id, size in queue_sizes.items() if size >= self.OVERLOAD_THRESHOLD], 
+                    key=lambda x: x[1], reverse=True
+                )
+                
+                for q_id, size, is_large in overloads:
+                    
+                    potential_targets = large_q_sizes if is_large else small_q_sizes
+                        
+                    # Encontrar o alvo: menor fila não-vazia do mesmo tipo, que tenha menos da metade do tamanho da fila sobrecarregada
+                    target_q_id = min(
+                        (q_target_id for q_target_id, q_target_size in potential_targets.items() 
+                         if q_target_id != q_id and q_target_size < size // 2),
+                        key=potential_targets.get,
+                        default=None
+                    )
+
+                    if target_q_id is None: continue
+                    
+                    source_q = self.head_queues[q_id]
+                    target_q = self.head_queues[target_q_id]
+                    
+                    # Move metade do diferencial entre a origem e o alvo
+                    move_count = max(self.MIN_MOVE_COUNT, (size - potential_targets[target_q_id]) // 2)
+                    
+                    items_moved = 0
+                    
+                    # Drenagem não-bloqueante
+                    for _ in range(move_count):
+                        try:
+                            item = source_q.get_nowait()
+                            target_q.put(item)
+                            items_moved += 1
+                        except queue.Empty:
+                            break
+                        except Exception:
+                            break
+
+                    if items_moved > 0:
+                        self._safe_print(f"↔️ HORIZONTAL Movidos {items_moved} arquivos de Q{q_id} (Size={size}) para Q{target_q_id}.", style="key")
+
+
+            except Exception as e:
+                self._safe_print(f"[error]Erro inesperado no Rebalancer: {type(e).__name__}: {e}[/error]", style="error")
+                time.sleep(5) 
+
+
 def process_worker_multi_head(
     head_id: int, 
     collection_name: str, 
     root_path: str, 
     password: str, 
     head_queues: Dict[int, multiprocessing.Queue],
-    my_queue_ids: List[int], 
+    global_process_assignments: Dict[int, List[int]], # Novo parâmetro para estado dinâmico
     global_metrics_dict: Dict[str, Any],
     global_non_uploaded_list: List[Tuple], 
 ):
@@ -1454,12 +1608,11 @@ def process_worker_multi_head(
     if head_id > NUM_PROCESSES_LARGE:
         pool_type = 'SMALL'
         worker_count = WORKERS_PER_HEAD_SMALL
-        # Mapeia o head_id de volta (ex: P9 -> Head 1 Físico)
-        real_head_id = head_id - NUM_PROCESSES_LARGE
-        
     
-    MAX_IDLE_CYCLES_STEALING = 40 # Aumentado devido ao maior pool de filas a checar
-    MAX_IDLE_CYCLES_UPLOAD_WAIT = 25 
+    
+    # NOVOS PARAMETROS DE OCIOISDADE (HYBRID STEALING)
+    MAX_IDLE_TIME_STEALING_SECONDS = 60.0 
+    MAX_UPLOAD_WAIT_TIME_SECONDS = 25.0 
     
     try:
         engine = UploadEngine(collection_name, root_path, password, head_id, worker_count, pool_type) 
@@ -1487,15 +1640,24 @@ def process_worker_multi_head(
 
             # --- LOOP DE PRODUÇÃO E STEALING NÃO-BLOQUEANTE ---
             
-            primary_queues = my_queue_ids # [Q1, Q9, Q10] ou [Q9, Q13]
+            # Não usa 'my_queue_ids' estático, mas sim o estado dinâmico
             all_queues_exhausted = False
-            idle_cycles = 0 
+            last_activity_time = time.time() 
             
-            engine._safe_print(f"[bold]Iniciando ciclo contínuo de scanning (Controlando Q{primary_queues})...[/bold]", style=None)
+            engine._safe_print(f"[bold]Iniciando ciclo contínuo de scanning (Lendo atribuição dinâmica)...[/bold]", style=None)
             
             # Ciclo principal de produção (Scanning e Chunking)
             while not all_queues_exhausted:
                 
+                # --- DYNAMIC STATE READ ---
+                # A cada ciclo, lê o estado atualizado do Rebalancer
+                primary_queues_current = global_process_assignments.get(head_id, []) 
+                if not primary_queues_current: 
+                    # Se o rebalancer ainda não atribuiu nada (só deve acontecer no começo), aguarda.
+                    time.sleep(0.5)
+                    continue
+                # --- END DYNAMIC STATE READ ---
+
                 # 1. Checa e Processa Scanners Concluídos
                 completed_futures = set()
                 for future in list(active_scanner_futures):
@@ -1517,20 +1679,23 @@ def process_worker_multi_head(
                     time.sleep(0.1)
                     continue
 
-                # 3. Tenta identificar o alvo de pull (Stealing Universal)
-                target_id = get_next_target_universal_steal(primary_queues, head_queues)
+                # 3. Tenta identificar o alvo de pull (Stealing Universal baseado no estado mutado)
+                target_id = get_next_target_universal_steal(primary_queues_current, head_queues)
                 
                 if target_id is None:
                     # Nenhuma fila acessível tem trabalho
                     
                     if not active_scanner_futures:
-                        # Se não há produção de chunks pendente
-                        idle_cycles += 1
-                        if idle_cycles > MAX_IDLE_CYCLES_STEALING: 
-                            engine._safe_print("[bold yellow]Fase de Scanning/Chunking DRENADA. Transição para espera de Uploads.[/bold yellow]", style=None)
+                        # Se não há produção de chunks pendente (o processo está totalmente ocioso)
+                        
+                        current_idle_time = time.time() - last_activity_time
+                        
+                        if current_idle_time >= MAX_IDLE_TIME_STEALING_SECONDS: 
+                            engine._safe_print(f"[bold yellow]Fase de Scanning/Chunking DRENADA ({current_idle_time:.1f}s ocioso). Transição para espera de Uploads.[/bold yellow]", style=None)
                             all_queues_exhausted = True
                         else:
-                            time.sleep(0.2) 
+                            # Espera e checa novamente (o Stealing Universal é contínuo até o timeout)
+                            time.sleep(0.5) 
                         continue
                     else:
                         # Há scanners ativos, espera a conclusão deles
@@ -1541,8 +1706,8 @@ def process_worker_multi_head(
                 queue_to_pull = head_queues[target_id]
                 file_batch = []
                 
-                # Pull agressivo para filas primárias, conservador para stealing
-                is_primary = target_id in primary_queues
+                # Pull agressivo para filas primárias ATUAIS, conservador para stealing
+                is_primary = target_id in primary_queues_current
                 pull_size = SCAN_WORKERS * 2 if is_primary else 1
                 
                 try:
@@ -1553,7 +1718,8 @@ def process_worker_multi_head(
                     pass 
                 
                 if file_batch:
-                    idle_cycles = 0
+                    last_activity_time = time.time() # Reseta o contador de ociosidade
+                    
                     # Submete scanners para a produção de chunks (não-bloqueante)
                     for file_info in file_batch:
                         future = scanner_executor.submit(engine._scan_and_hash_worker_multi_head, file_info)
@@ -1575,8 +1741,8 @@ def process_worker_multi_head(
                 time.sleep(1)
                 
                 # Check for critical timeout
-                if time.time() - upload_wait_start > MAX_IDLE_CYCLES_UPLOAD_WAIT:
-                    engine._safe_print(f"[alert]Tempo de espera ({MAX_IDLE_CYCLES_UPLOAD_WAIT}s) excedido para Uploads e MPU Completion. Forçando finalização dos MPUs abertos.[/alert]", style=None)
+                if time.time() - upload_wait_start > MAX_UPLOAD_WAIT_TIME_SECONDS:
+                    engine._safe_print(f"[alert]Tempo de espera ({MAX_UPLOAD_WAIT_TIME_SECONDS}s) excedido para Uploads e MPU Completion. Forçando finalização dos MPUs abertos.[/alert]", style=None)
                     break
                     
                 progress.update(overall_task, description=f"[bold magenta]Fase 3: Limpeza/Aguardando Uploads ({len(engine.mpu_state)} MPUs restantes)...[/bold magenta]")
@@ -1626,7 +1792,7 @@ def process_worker_multi_head(
 
 if __name__ == "__main__":
     os.system('cls' if os.name == 'nt' else 'clear')
-    console.print(Panel.fit("[bold white on magenta] MEGA CRYPTO HASH UPLOADER (V24.0.1 - FLUXO HÍBRIDO 8+4 OTIMIZADO) [/bold white on magenta]", border_style="magenta"))
+    console.print(Panel.fit("[bold white on magenta] MEGA CRYPTO HASH UPLOADER (V24.0.1 - FLUXO HÍBRIDO 8+4 OTIMIZADO C/ MUTAÇÃO DE HEADS) [/bold white on magenta]", border_style="magenta"))
     
     target_folder = None
     collection_name = None
@@ -1735,6 +1901,17 @@ if __name__ == "__main__":
         # CORREÇÃO: Usando multiprocessing.Queue() nativa para as filas de dados (Q1-Q16)
         head_queues: Dict[int, multiprocessing.Queue] = {i: multiprocessing.Queue() for i in range(1, 16 + 1)}
         
+        # Estado dinâmico para a mutação dos processos
+        global_process_assignments = manager.dict()
+        for p_id in range(1, NUM_TOTAL_PROCESSES + 1):
+            if p_id <= NUM_PROCESSES_LARGE:
+                # P1-P8: Inicialmente Primário Large + Steal Small
+                global_process_assignments[p_id] = list(PROCESS_QUEUE_MAP[p_id])
+            else:
+                # P9-P12: Inicialmente Primário Small
+                global_process_assignments[p_id] = list(PROCESS_QUEUE_MAP_SMALL[p_id]) 
+        
+        
         console.print(f"[info]⚙️ Iniciando Orquestração Hierárquica e Alocação (Total de 16 Filas Lógicas mapeadas em {NUM_TOTAL_PROCESSES} Processos)...[/info]")
         
         orchestration_metrics, group_report = orchestrate_and_queue_hierarchical(
@@ -1742,39 +1919,42 @@ if __name__ == "__main__":
             head_queues
         )
         
-        console.print("\n--- Distribuição Final (V24.0.1 Otimizada) ---")
+        console.print("\n--- Distribuição Inicial (V24.0.1 Otimizada c/ Mutação) ---")
         console.print(f"Total de Arquivos Alocados: [bold green]{orchestration_metrics['total_files_allocated']}[/bold green]")
         console.print(f"Total de Dados Alocados: [bold cyan]{humanize.naturalsize(orchestration_metrics['total_size_allocated'])}[/bold cyan]")
         console.print(f"Heads de Processamento Ativos: [bold yellow]{NUM_PROCESSES_LARGE} LARGE + {NUM_PROCESSES_SMALL} SMALL Processos[/bold yellow]")
         console.print(f"Total de Upload Workers: {TOTAL_UPLOAD_WORKERS} (Com Semáforo de I/O de Disco de 4x por Processo)")
         console.print("--------------------------\n")
         
-        # 4. Inicia Processos (1 a 8 - LARGE Pool, 9 a 12 - SMALL Pool)
+        # 4. Inicia Processos (Rebalancer + Heads)
         processes = []
         global_metrics = manager.dict() 
         global_non_uploaded = manager.list() 
+        rebalancer_stop_event = manager.Event()
         
-        # Processos Large (P1-P8)
+        # A) Inicia o Rebalancer (Monitora filas, move arquivos e MUTAS processos)
+        rebalancer = QueueRebalancerProcess(head_queues, rebalancer_stop_event, global_process_assignments)
+        processes.append(rebalancer)
+        rebalancer.start()
+        
+        # B) Processos Large (P1-P8)
         for i in range(1, NUM_PROCESSES_LARGE + 1):
-            my_queue_ids = PROCESS_QUEUE_MAP[i]
             p = Process(target=process_worker_multi_head, args=(
                 i, 
                 collection_name, 
                 target_folder, 
                 password, 
                 head_queues, 
-                my_queue_ids,
+                global_process_assignments, # Passando o estado dinâmico
                 global_metrics,
                 global_non_uploaded,
             ))
             processes.append(p)
             p.start()
             
-        # Processos Small (P9-P12)
+        # C) Processos Small (P9-P12)
         for i in range(1, NUM_PROCESSES_SMALL + 1):
             process_id = NUM_PROCESSES_LARGE + i # P9, P10, P11, P12
-            # Usa o mapeamento de filas Small
-            my_queue_ids = PROCESS_QUEUE_MAP_SMALL[i + 8] 
             
             p = Process(target=process_worker_multi_head, args=(
                 process_id, # Passa o ID P9-P12
@@ -1782,7 +1962,7 @@ if __name__ == "__main__":
                 target_folder, 
                 password, 
                 head_queues, 
-                my_queue_ids,
+                global_process_assignments, # Passando o estado dinâmico
                 global_metrics,
                 global_non_uploaded,
             ))
@@ -1790,10 +1970,26 @@ if __name__ == "__main__":
             p.start()
         
         
-        for p in processes:
+        # 5. Espera a conclusão dos Heads de Upload/Scanning (P1-P12)
+        
+        # Remove o rebalancer temporariamente da lista de espera
+        upload_heads = [p for p in processes if p != rebalancer] 
+        
+        for p in upload_heads:
             p.join()
+            
+        console.print("\n[success]TODAS AS HEADS DE UPLOAD CONCLUÍRAM. Sinalizando o Rebalancer.[/success]")
+        
+        # Sinaliza o Rebalancer para parar e espera
+        rebalancer_stop_event.set()
+        rebalancer.join(timeout=10)
+        
+        if rebalancer.is_alive():
+            console.print("[warning]Rebalancer não parou. Terminando forçadamente.[/warning]")
+            rebalancer.terminate()
 
-        # 5. Agregação final (Lendo o DB para métricas finais globais)
+
+        # 6. Agregação final (Lendo o DB para métricas finais globais)
         
         total_uploaded = sum(global_metrics.get(f'P{i}_uploaded', 0) for i in range(1, NUM_TOTAL_PROCESSES + 1))
         total_failed = sum(global_metrics.get(f'P{i}_failed', 0) for i in range(1, NUM_TOTAL_PROCESSES + 1))
@@ -1827,7 +2023,7 @@ if __name__ == "__main__":
         )
         
         final_panel_content = (
-            f"[bold green]OPERAÇÃO GLOBAL FINALIZADA! ({NUM_TOTAL_PROCESSES} PROCESSOS)[/bold green]\n\n"
+            f"[bold green]OPERAÇÃO GLOBAL FINALIZADA! ({NUM_TOTAL_PROCESSES} PROCESSOS + MUTAÇÃO DE HEADS)[/bold green]\n\n"
             f"📦 Coleção: [cyan]{collection_name}[/cyan]\n"
             f"✅ Uploads Concluídos: [success]{final_metrics['uploaded']}[/success]\n"
             f"🚫 Arquivos Ignorados: [warning]{final_metrics['ignored']}[/warning]\n"
@@ -1839,11 +2035,11 @@ if __name__ == "__main__":
     except Exception as e:
         console.print(Panel(f"[bold red]ERRO CRÍTICO NO CONTROLADOR DE PROCESSOS: [/bold red]{type(e).__name__}: {e}", title="Falha Inesperada", border_style="red"))
     finally:
+        # Garantia de término de todos os processos
+        rebalancer_stop_event.set()
         for p in processes:
             if p.is_alive():
                 p.terminate()
         
     console.print("\n[bold magenta]*** FIM DA SESSÃO ***[/bold magenta]")
     input("Pressione ENTER para fechar...")
-
-# --- END OF FILE Paste January 25, 2026 - 11:15PM (V24.0.1) ---
