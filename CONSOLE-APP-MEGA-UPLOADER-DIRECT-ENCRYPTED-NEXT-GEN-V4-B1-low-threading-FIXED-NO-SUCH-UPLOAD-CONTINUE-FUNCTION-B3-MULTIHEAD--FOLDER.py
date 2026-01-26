@@ -1,3 +1,5 @@
+# --- START OF FILE Paste January 25, 2026 - 11:15PM (V24.0.1) ---
+
 # -*- coding: utf-8 -*-
 import os
 import sys
@@ -20,6 +22,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Optional, Tuple, Dict, Any, List, Union, Set, Callable
 import sqlite3
 from datetime import datetime
+import multiprocessing
 from multiprocessing import Process, Manager, Queue as MPQueue
 from boto3.session import Config 
 import uuid 
@@ -37,32 +40,37 @@ from rich.prompt import Prompt
 from rich.panel import Panel
 from rich.theme import Theme
 
+# ========================================================================
+# === CONFIGURAÇÕES GLOBAIS ===
+# ========================================================================
 MEGA_S3_ENDPOINT = "XXX"
 ACCESS_KEY = "XXX"
 SECRET_KEY = "XXX"
 
-SCAN_WORKERS = 8    
+# === REVISED GLOBAL CONSTANTS FOR V24.0.1 ===
+NUM_PROCESSES_LARGE = 8 # Heads Primárias (P1-P8)
+NUM_PROCESSES_SMALL = 4 # Heads Dedicadas a Small Files (P9-P12)
+NUM_TOTAL_PROCESSES = NUM_PROCESSES_LARGE + NUM_PROCESSES_SMALL # 12 Processos Totais
 
-# --- V23.0.1 FLUXO HÍBRIDO OTIMIZADO (8 PROCESSOS FORTES) ---
-NUM_PROCESSES = 8 # AJUSTADO PARA 8 Motores Processuais
+# Threads por Head (Processo)
+LARGE_UPLOAD_WORKERS = 22   
+SMALL_UPLOAD_WORKERS = 6    
+MICRO_UPLOAD_WORKERS = 15   # Dedicado ao pool SMALL
+SCAN_WORKERS = 8            # Reduzido para aliviar a disputa de I/O de disco/CPU
 
-# Workers/Threads ALOCADOS DENTRO DE CADA UM DOS 8 PROCESSOS (H1 a H8):
-LARGE_UPLOAD_WORKERS = 36   # Para arquivos > 10MB (Aumentado de 10 para 15)
-SMALL_UPLOAD_WORKERS = 14    # Para arquivos <= 10MB (Aumentado de 4 para 5)
+WORKERS_PER_HEAD_LARGE = LARGE_UPLOAD_WORKERS + SMALL_UPLOAD_WORKERS # 20 Upload Workers
+WORKERS_PER_HEAD_SMALL = MICRO_UPLOAD_WORKERS + SCAN_WORKERS          # 14 Upload Workers (Micro Pool)
+TOTAL_UPLOAD_WORKERS = (NUM_PROCESSES_LARGE * WORKERS_PER_HEAD_LARGE) + (NUM_PROCESSES_SMALL * WORKERS_PER_HEAD_SMALL)
 
-WORKERS_PER_HEAD = LARGE_UPLOAD_WORKERS + SMALL_UPLOAD_WORKERS # 15 + 5 = 20 Upload Workers por Head
-TOTAL_UPLOAD_WORKERS = NUM_PROCESSES * WORKERS_PER_HEAD # 8 * 20 = 160 (Aumentado de 56 para 160)
+# Max Connections: Deve acomodar todos os workers + overhead
+MAX_POOL_CONNECTIONS = TOTAL_UPLOAD_WORKERS + (NUM_TOTAL_PROCESSES * SCAN_WORKERS) + 50 
 
-# 20 + 8 + 10 = 38
-MAX_POOL_CONNECTIONS = WORKERS_PER_HEAD + SCAN_WORKERS + 200 # Aumentado para 38
-MAX_THREADS = 100 # Aumentado para acomodar o pool local + overhead da S3 Config
-
-MPU_PART_SIZE = 8 * 1024 * 1024 
+MPU_PART_SIZE = 8 * 1024 * 1024 # Aumentado de 8MB para 32MB para reduzir overhead de request
 CHUNK_SIZE = MPU_PART_SIZE 
 
 NONCE_SIZE = 8 
 MAX_RETRIES = 100 
-RETRY_DELAY = 20 # Mantido em 20s
+RETRY_DELAY = 20 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 KEY_FILE = SCRIPT_DIR / "masterkey.storagekey"
@@ -97,40 +105,43 @@ SIZE_10MB = 10 * 1024 * 1024
 SIZE_1MB = 1 * 1024 * 1024
 SIZE_100KB = 100 * 1024
 
-# Dicionário de Workers para a lógica de orquestração (Agora usados internamente)
-WORKER_DISTRIBUTION = {
-    'LARGE': LARGE_UPLOAD_WORKERS,
-    'SMALL': SMALL_UPLOAD_WORKERS,
-}
-
-# Mapeamento Lógico H1-H16 (Todos são criados, mas H9-H16 são consumidos pelos processos H1-H8)
+# Mapeamento Lógico H1-H16 (Lógica de Alocação Inicial)
 HEAD_GROUPS = {
     # GRUPOS LARGE (8 Heads, H1-H8) - Primários
-    1: {'name': 'TOP_A (>10M)', 'partner': 2, 'stealing': [8, 7, 5, 6, 4, 3], 'size_pool': 'LARGE'},
-    2: {'name': 'TOP_B (>10M)', 'partner': 1, 'stealing': [8, 7, 5, 6, 4, 3], 'size_pool': 'LARGE'},
-    3: {'name': 'VIDEO_SMALL (>10M)', 'partner': 4, 'stealing': [8, 7, 5, 6, 1, 2], 'size_pool': 'LARGE'},
-    4: {'name': 'VIDEO_LARGE (>10M)', 'partner': 3, 'stealing': [8, 7, 5, 6, 1, 2], 'size_pool': 'LARGE'},
-    5: {'name': 'GEN_MED_100MB (>10M)', 'partner': 6, 'stealing': [8, 7, 4, 3, 1, 2], 'size_pool': 'LARGE'},
-    6: {'name': 'GEN_MED_1GB (>10M)', 'partner': 5, 'stealing': [8, 7, 4, 3, 1, 2], 'size_pool': 'LARGE'},
-    7: {'name': 'GEN_BIG_5GB (>10M)', 'partner': 8, 'stealing': [5, 6, 4, 3, 1, 2], 'size_pool': 'LARGE'},
-    8: {'name': 'GEN_HUGE (>5GB)', 'partner': 7, 'stealing': [5, 6, 4, 3, 1, 2], 'size_pool': 'LARGE'},
+    1: {'name': 'TOP_A (>10M)', 'size_pool': 'LARGE', 'primary_queues': [1], 'small_steal_initial': [9, 10]},
+    2: {'name': 'TOP_B (>10M)', 'size_pool': 'LARGE', 'primary_queues': [2], 'small_steal_initial': [11, 12]},
+    3: {'name': 'VIDEO_SMALL (>10M)', 'size_pool': 'LARGE', 'primary_queues': [3], 'small_steal_initial': [13]},
+    4: {'name': 'VIDEO_LARGE (>10M)', 'size_pool': 'LARGE', 'primary_queues': [4], 'small_steal_initial': [14]},
+    5: {'name': 'GEN_MED_100MB (>10M)', 'size_pool': 'LARGE', 'primary_queues': [5], 'small_steal_initial': [15]},
+    6: {'name': 'GEN_MED_1GB (>10M)', 'size_pool': 'LARGE', 'primary_queues': [6], 'small_steal_initial': [16]},
+    7: {'name': 'GEN_BIG_5GB (>10M)', 'size_pool': 'LARGE', 'primary_queues': [7], 'small_steal_initial': []},
+    8: {'name': 'GEN_HUGE (>5GB)', 'size_pool': 'LARGE', 'primary_queues': [8], 'small_steal_initial': []},
     
-    # GRUPOS SMALL (H9-H16) - Secundários, Mapeados em H1-H8
-    9: {'name': 'TINY_100KB_A (Mapped to H1)', 'partner': 10, 'stealing': [11, 12, 13, 14, 15, 16], 'size_pool': 'SMALL'},
-    10: {'name': 'TINY_100KB_B (Mapped to H2)', 'partner': 9, 'stealing': [11, 12, 13, 14, 15, 16], 'size_pool': 'SMALL'},
-    11: {'name': 'SMALL_1MB_A (Mapped to H3)', 'partner': 12, 'stealing': [9, 10, 13, 14, 15, 16], 'size_pool': 'SMALL'},
-    12: {'name': 'SMALL_1MB_B (Mapped to H4)', 'partner': 11, 'stealing': [9, 10, 13, 14, 15, 16], 'size_pool': 'SMALL'},
-    13: {'name': 'MED_10MB_A (Mapped to H5)', 'partner': 14, 'stealing': [9, 10, 11, 12, 15, 16], 'size_pool': 'SMALL'},
-    14: {'name': 'MED_10MB_B (Mapped to H6)', 'partner': 13, 'stealing': [9, 10, 11, 12, 15, 16], 'size_pool': 'SMALL'},
-    15: {'name': 'MED_10MB_C (Mapped to H7)', 'partner': 16, 'stealing': [9, 10, 11, 12, 13, 14], 'size_pool': 'SMALL'},
-    16: {'name': 'MED_10MB_D (Mapped to H8)', 'partner': 15, 'stealing': [9, 10, 11, 12, 13, 14], 'size_pool': 'SMALL'},
+    # GRUPOS SMALL (H9-H16) - Secundários (Consumidos pelos Micro-Processos P9-P12)
+    9: {'name': 'TINY_100KB_A', 'size_pool': 'SMALL', 'primary_queues': [9]},
+    10: {'name': 'TINY_100KB_B', 'size_pool': 'SMALL', 'primary_queues': [10]},
+    11: {'name': 'SMALL_1MB_A', 'size_pool': 'SMALL', 'primary_queues': [11]},
+    12: {'name': 'SMALL_1MB_B', 'size_pool': 'SMALL', 'primary_queues': [12]},
+    13: {'name': 'MED_10MB_A', 'size_pool': 'SMALL', 'primary_queues': [13]},
+    14: {'name': 'MED_10MB_B', 'size_pool': 'SMALL', 'primary_queues': [14]},
+    15: {'name': 'MED_10MB_C', 'size_pool': 'SMALL', 'primary_queues': [15]},
+    16: {'name': 'MED_10MB_D', 'size_pool': 'SMALL', 'primary_queues': [16]},
 }
 
 # Mapeamento Processual (Físico) para Fila (Lógica)
-# Head físico H1 consome a Fila de Large (1) e a Fila de Small (9)
+# P1-P8: Consomem Large (Q1-Q8) + Stealing de Small (Q9-Q16)
+# P9-P12: Consomem Small (Q9-Q16) + Stealing de Large (Q1-Q8)
 PROCESS_QUEUE_MAP = {
-    h_id: [h_id, h_id + 8] 
-    for h_id in range(1, NUM_PROCESSES + 1)
+    h_id: [h_id] + HEAD_GROUPS[h_id].get('small_steal_initial', []) # Primárias (Q1..8) + Steal Inicial Small
+    for h_id in range(1, NUM_PROCESSES_LARGE + 1)
+}
+# Mapeamento para os 4 Processos de Micro-Arquivos (P9-P12)
+# P9 -> Q9, Q13
+# P10 -> Q10, Q14
+# P11 -> Q11, Q15
+# P12 -> Q12, Q16
+PROCESS_QUEUE_MAP_SMALL = {
+    9: [9, 13], 10: [10, 14], 11: [11, 15], 12: [12, 16]
 }
 
 
@@ -146,6 +157,7 @@ LOG_DB_PATH = LOG_DIR / "control_data.db"
 FileInfoTuple = Tuple[Path, int, str, str]
 
 class CryptoEngine:
+# ... (Seu código existente da CryptoEngine, que está OK) ...
     SALT_SIZE = 16
     IV_SIZE = 16
     KEY_SIZE = 32
@@ -285,11 +297,13 @@ class EncryptedFileStreamV2:
             self.active_encryptor.update(discard_data)
             
 
+    # === CORREÇÃO DE PERFOMANCE: Uso de b''.join() para evitar alocação de memória ===
     def read(self, size: int) -> bytes:
         if not self._f: return b''
         
-        bytes_read = b''
+        chunks = [] # Lista de chunks (otimizado)
         remaining_size = size
+        total_read = 0
 
         while remaining_size > 0:
             
@@ -299,31 +313,28 @@ class EncryptedFileStreamV2:
                 
                 chunk = self.header[self.active_pos : self.active_pos + read_len]
                 self.active_pos += len(chunk)
-                bytes_read += chunk
+                chunks.append(chunk)
+                total_read += len(chunk)
                 remaining_size -= len(chunk)
                 
                 if self.active_pos == self.header_size:
                      self._setup_encryptor_for_seek(self.header_size)
                      if remaining_size == 0:
-                         return bytes_read
-                else:
-                    return bytes_read
-                
+                         break
             else:
                 data_to_read_raw = min(remaining_size, self.total_size - self.active_pos)
                 
                 if data_to_read_raw == 0:
-                    # Finalize the encryptor for the very last read
                     if self.active_encryptor:
                         try:
                             final_chunk = self.active_encryptor.finalize()
                             self.active_encryptor = None
                             if final_chunk:
                                 self.active_pos += len(final_chunk)
-                                return bytes_read + final_chunk
+                                chunks.append(final_chunk)
                         except Exception:
                             pass 
-                    return bytes_read
+                    break
                 
                 raw_data = self._f.read(data_to_read_raw)
                 
@@ -334,20 +345,20 @@ class EncryptedFileStreamV2:
                             self.active_encryptor = None
                             if final_chunk:
                                 self.active_pos += len(final_chunk)
-                                return bytes_read + final_chunk
+                                chunks.append(final_chunk)
                         except Exception:
                             pass 
-                    return bytes_read
+                    break
                     
                 encrypted_data = self.active_encryptor.update(raw_data)
                 self.active_pos += len(encrypted_data)
-                bytes_read += encrypted_data
+                chunks.append(encrypted_data)
                 remaining_size -= len(encrypted_data)
                 
                 if len(encrypted_data) < data_to_read_raw:
-                    return bytes_read
+                    break
                     
-        return bytes_read
+        return b''.join(chunks) # Final de b''.join(chunks)
 
     def tell(self): return self.active_pos 
     
@@ -378,6 +389,7 @@ class EncryptedFileStreamV2:
         return False 
 
 class LogWriterThread(threading.Thread):
+# ... (Seu código existente da LogWriterThread, que está OK) ...
     def __init__(self, log_queue, db_path, run_id, pc_name, drive_letter):
         super().__init__()
         self.log_queue = log_queue
@@ -491,6 +503,7 @@ class LogWriterThread(threading.Thread):
 
 
 class LogControlDB:
+# ... (Seu código existente da LogControlDB, que está OK) ...
     def __init__(self, pc_name: str, root_path: str, collection: str, worker_id: int = 1, db_path: Path = LOG_DB_PATH):
         LOG_DIR.mkdir(parents=True, exist_ok=True)
         
@@ -674,16 +687,20 @@ class LogControlDB:
 
 class UploadEngine:
 
-    def __init__(self, collection_name, root_path, password, head_id: int, upload_worker_count: int):
+    def __init__(self, collection_name, root_path, password, head_id: int, upload_worker_count: int, pool_type: str = 'LARGE'):
         self.root_path = Path(root_path)
         self.collection = collection_name
         self.head_id = head_id 
         self.upload_worker_count = upload_worker_count
+        self.pool_type = pool_type
         self.crypto = CryptoEngine()
+        
+        # NOVO: Semáforo para limitar a I/O de disco e criptografia
+        self.disk_io_semaphore = threading.Semaphore(4) 
         
         # Otimizando a configuração do S3 para o número de workers local
         s3_config = Config(
-            max_pool_connections=MAX_POOL_CONNECTIONS, # Usando a constante global
+            max_pool_connections=MAX_POOL_CONNECTIONS, 
             connect_timeout=120, 
             read_timeout=240     
         )
@@ -705,7 +722,7 @@ class UploadEngine:
         self.log_db.start_writer() 
         
         self.local_console = Console(theme=custom_theme)
-        self._safe_print(f"[info]📊 HEAD {self.head_id} (Workers: {self.upload_worker_count}) | Log DB ID: {self.log_db.run_id}[/info]", style=None)
+        self._safe_print(f"[info]📊 HEAD P{self.head_id} ({self.pool_type} Pool) | Workers: {self.upload_worker_count} | Log DB ID: {self.log_db.run_id}[/info]", style=None)
         
         self._ensure_bucket() 
 
@@ -723,16 +740,16 @@ class UploadEngine:
 
     def _safe_print(self, text, style=None):
         try:
-            prefix = f"[HEAD {self.head_id}]"
+            prefix = f"[P{self.head_id}]"
             if style:
                 self.local_console.print(f"{prefix}[{style}]{text}[/{style}]")
             else:
                 self.local_console.print(f"{prefix}{text}")
         except UnicodeEncodeError:
             sanitized_text = text.encode('ascii', 'replace').decode('ascii').replace('?', '*')
-            self.local_console.print(f"[HEAD {self.head_id}][bold red]**** ERRO UNICODE ****: {sanitized_text} [/bold red]")
+            self.local_console.print(f"[P{self.head_id}][bold red]**** ERRO UNICODE ****: {sanitized_text} [/bold red]")
         except Exception:
-            self.local_console.print(f"[HEAD {self.head_id}][bold red]**** ERRO GERAL DE CONSOLE ****[/bold red]")
+            self.local_console.print(f"[P{self.head_id}][bold red]**** ERRO GERAL DE CONSOLE ****[/bold red]")
 
 
     def _ensure_bucket(self):
@@ -956,10 +973,11 @@ class UploadEngine:
                 
                 full_metadata_path = Path(pc_name_meta) / drive_letter_meta / self._get_original_path_metadata(file_path)
 
-                # 2. Leitura Just-In-Time (JIT) do Chunk
-                with self.crypto.create_encrypted_stream(file_path, full_metadata_path.as_posix()) as stream:
-                    stream.seek(offset)
-                    chunk_data = stream.read(length) 
+                # 2. Leitura Just-In-Time (JIT) do Chunk (Com Semáforo para Limitar I/O de Disco/CPU)
+                with self.disk_io_semaphore:
+                    with self.crypto.create_encrypted_stream(file_path, full_metadata_path.as_posix()) as stream:
+                        stream.seek(offset)
+                        chunk_data = stream.read(length) 
 
                 if chunk_data is None or len(chunk_data) != length:
                     self._safe_print(f"[ERROR] ERRO READ: Falha ao ler {length} bytes de {file_path.name}. Abortando MPU.", style="error")
@@ -1101,6 +1119,7 @@ def is_folder_ignored(path_segment: str) -> bool:
     return path_segment.lower() in FORCED_IGNORE_FOLDERS
 
 def generate_markdown_log(pc_name, collection_name, root_path, final_metrics, non_uploaded_files):
+# ... (Seu código existente da generate_markdown_log, que está OK) ...
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     log_file_name = LOG_DIR / f"log_summary_{pc_name}_{timestamp}.md"
     
@@ -1130,6 +1149,7 @@ def generate_markdown_log(pc_name, collection_name, root_path, final_metrics, no
     console.print(f"[success]✅ Relatório final de execução salvo em: [path]{log_file_name.name}[/path][/success]")
 
 def select_folder_gui():
+# ... (Seu código existente da select_folder_gui, que está OK) ...
     root = tk.Tk()
     root.withdraw() 
     folder_selected = filedialog.askdirectory()
@@ -1140,7 +1160,7 @@ def scan_and_orchestrate_files(
     scan_mode: int,
     files_to_ignore_set: Set[str]
 ) -> Tuple[Dict[Tuple[str, str], List[FileInfoTuple]], List[Tuple[Path, int]], List[str]]:
-    
+# ... (Seu código existente da scan_and_orchestrate_files, que está OK) ...
     base_path = Path(target_folder)
     all_files_on_disk: List[Path] = []
     ignored_system_files: List[Tuple[Path, int]] = []
@@ -1255,9 +1275,9 @@ def scan_and_orchestrate_files(
 
 def orchestrate_and_queue_hierarchical(
     file_groups: Dict[Tuple[str, str], List[FileInfoTuple]],
-    head_queues: Dict[int, MPQueue]
+    head_queues: Dict[int, multiprocessing.Queue] # Usando Queue nativa
 ) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
-    
+# ... (Seu código existente da orchestrate_and_queue_hierarchical, que está OK) ...
     group_sizes = {key: sum(f[1] for f in files) for key, files in file_groups.items()}
     sorted_groups = sorted(group_sizes.items(), key=lambda item: item[1], reverse=False)
     
@@ -1298,7 +1318,7 @@ def orchestrate_and_queue_hierarchical(
     
 def allocate_files_to_queues(
     pending_files: List[FileInfoTuple],
-    queues: Dict[int, MPQueue]
+    queues: Dict[int, multiprocessing.Queue] # Usando Queue nativa
 ) -> List[FileInfoTuple]:
     
     files_to_process_info: List[Tuple[Path, int, str, str, str]] = []
@@ -1381,13 +1401,46 @@ def allocate_files_to_queues(
                 
     return []
 
+# === NOVO: Funções de Stealing e Processamento ===
+
+# Lista de todas as 16 filas lógicas
+ALL_LARGE_QUEUES = list(range(1, 8 + 1))
+ALL_SMALL_QUEUES = list(range(9, 16 + 1))
+ALL_QUEUES = ALL_LARGE_QUEUES + ALL_SMALL_QUEUES
+
+def get_next_target_universal_steal(
+    primary_queues: List[int], 
+    head_queues: Dict[int, multiprocessing.Queue]
+) -> Optional[int]:
+    
+    # 1. Prioridade Máxima: Filas Primárias (Aggressive Pull)
+    for q_id in primary_queues:
+        if not head_queues[q_id].empty():
+            return q_id
+    
+    # 2. Stealing Universal: Tenta qualquer fila não-primária (Conservative Pull)
+    # A ordem de checagem é importante: Processos Large devem priorizar Large
+    
+    if primary_queues[0] in ALL_LARGE_QUEUES:
+        # HEAD LARGE (P1-P8): Steal de Large, depois Small
+        steal_targets = [q_id for q_id in ALL_LARGE_QUEUES if q_id not in primary_queues] + ALL_SMALL_QUEUES
+    else:
+        # HEAD SMALL (P9-P12): Steal de Small, depois Large
+        steal_targets = [q_id for q_id in ALL_SMALL_QUEUES if q_id not in primary_queues] + ALL_LARGE_QUEUES
+        
+    for q_id in steal_targets:
+        if not head_queues[q_id].empty():
+            return q_id
+            
+    return None
+
 def process_worker_multi_head(
     head_id: int, 
     collection_name: str, 
     root_path: str, 
     password: str, 
-    head_queues: Dict[int, MPQueue],
-    my_queue_ids: List[int], # [1, 9] for H1
+    head_queues: Dict[int, multiprocessing.Queue],
+    my_queue_ids: List[int], 
     global_metrics_dict: Dict[str, Any],
     global_non_uploaded_list: List[Tuple], 
 ):
@@ -1395,18 +1448,24 @@ def process_worker_multi_head(
     local_console = Console(theme=custom_theme)
     engine = None
     
-    worker_count = WORKERS_PER_HEAD 
-    pool_type = 'HYBRID'
+    pool_type = 'LARGE'
+    worker_count = WORKERS_PER_HEAD_LARGE
+    
+    if head_id > NUM_PROCESSES_LARGE:
+        pool_type = 'SMALL'
+        worker_count = WORKERS_PER_HEAD_SMALL
+        # Mapeia o head_id de volta (ex: P9 -> Head 1 Físico)
+        real_head_id = head_id - NUM_PROCESSES_LARGE
         
     
-    MAX_IDLE_CYCLES_STEALING = 25 # Wait 25 cycles (approx 12.5 seconds max pause) for stealing before terminating production
-    MAX_IDLE_CYCLES_UPLOAD_WAIT = 15 # Wait 15 seconds after production ends before forcing shutdown check
+    MAX_IDLE_CYCLES_STEALING = 40 # Aumentado devido ao maior pool de filas a checar
+    MAX_IDLE_CYCLES_UPLOAD_WAIT = 25 
     
     try:
-        engine = UploadEngine(collection_name, root_path, password, head_id, worker_count) 
+        engine = UploadEngine(collection_name, root_path, password, head_id, worker_count, pool_type) 
         
         with Progress(
-            TextColumn(f"[bold blue]HEAD {head_id} ({pool_type}) - [/bold blue]"+"{task.description}"), 
+            TextColumn(f"[bold blue]HEAD P{head_id} ({pool_type}) - [/bold blue]"+"{task.description}"), 
             BarColumn(),
             "[progress.percentage]{task.percentage:>3.0f}%",
             TransferSpeedColumn(),
@@ -1428,53 +1487,12 @@ def process_worker_multi_head(
 
             # --- LOOP DE PRODUÇÃO E STEALING NÃO-BLOQUEANTE ---
             
-            # Ordem de prioridade inicial: Large (Primary), Small (Mapped), Partner Large, Steal Large, Steal Small
-            
-            # O Head sempre prioriza suas duas filas: LARGE e SMALL mapeada (ex: H1 -> Q1, Q9)
-            current_target_id_index = 0 # 0 = Large Queue (e.g., Q1), 1 = Small Queue (e.g., Q9)
-            
-            primary_queues = my_queue_ids # [1, 9]
-            
-            # Constantes de Stealing
-            large_stealing_targets = HEAD_GROUPS[head_id]['stealing']
-            small_stealing_targets = HEAD_GROUPS[head_id + 8]['stealing']
-            
+            primary_queues = my_queue_ids # [Q1, Q9, Q10] ou [Q9, Q13]
             all_queues_exhausted = False
             idle_cycles = 0 
             
-            engine._safe_print(f"[bold]Iniciando ciclo contínuo de scanning (Controle Q{primary_queues})...[/bold]", style=None)
+            engine._safe_print(f"[bold]Iniciando ciclo contínuo de scanning (Controlando Q{primary_queues})...[/bold]", style=None)
             
-            # Fila de tentativas: (Target ID, Pull Agressivo)
-            # Prioridade: Próprias Filas (Agressivo), Parceiro (Agressivo), Stealing Grande (Conservador), Stealing Pequeno (Conservador)
-            
-            def get_next_target(current_idx: int, check_partner=False, check_stealing=False) -> Optional[int]:
-                
-                # 1. Checa as duas filas primárias deste Head
-                for i in range(len(primary_queues)):
-                    q_id = primary_queues[i]
-                    if not head_queues[q_id].empty():
-                        return q_id
-                
-                # 2. Tenta o Parceiro (Sempre do pool LARGE, pois SMALL é co-localizado)
-                if check_partner:
-                    partner_id = HEAD_GROUPS[head_id]['partner']
-                    if not head_queues[partner_id].empty():
-                        return partner_id
-
-                # 3. Tenta Stealing LARGE Pool
-                if check_stealing:
-                    for target_id in large_stealing_targets:
-                        if not head_queues[target_id].empty():
-                            return target_id
-
-                    # 4. Tenta Stealing SMALL Pool
-                    for target_id in small_stealing_targets:
-                        if not head_queues[target_id].empty():
-                            return target_id
-                            
-                return None
-
-
             # Ciclo principal de produção (Scanning e Chunking)
             while not all_queues_exhausted:
                 
@@ -1494,13 +1512,13 @@ def process_worker_multi_head(
                             
                 active_scanner_futures -= completed_futures
                 
-                # Se o pool de scanners estiver cheio ou o pool de uploaders saturado, espera um pouco
-                if scanner_executor._max_workers == len(active_scanner_futures) or engine.upload_queue.qsize() > worker_count * 10:
+                # 2. Lógica de Pacing (Controle de fluxo)
+                if scanner_executor._max_workers == len(active_scanner_futures) or engine.upload_queue.qsize() > worker_count * 5:
                     time.sleep(0.1)
                     continue
 
-                # 2. Tenta identificar o alvo de pull (Prioridade: Próprias Filas > Stealing)
-                target_id = get_next_target(current_target_id_index, check_partner=True, check_stealing=True)
+                # 3. Tenta identificar o alvo de pull (Stealing Universal)
+                target_id = get_next_target_universal_steal(primary_queues, head_queues)
                 
                 if target_id is None:
                     # Nenhuma fila acessível tem trabalho
@@ -1512,24 +1530,26 @@ def process_worker_multi_head(
                             engine._safe_print("[bold yellow]Fase de Scanning/Chunking DRENADA. Transição para espera de Uploads.[/bold yellow]", style=None)
                             all_queues_exhausted = True
                         else:
-                            # Pausa maior para permitir que outros heads produzam ou que o S3 se recupere
-                            time.sleep(0.5) 
+                            time.sleep(0.2) 
                         continue
                     else:
                         # Há scanners ativos, espera a conclusão deles
                         time.sleep(0.2)
                         continue
                 
-                # 3. Pull de Arquivos da fila alvo
+                # 4. Pull de Arquivos da fila alvo
                 queue_to_pull = head_queues[target_id]
                 file_batch = []
                 
-                pull_size = SCAN_WORKERS * 2 if target_id in primary_queues or target_id == HEAD_GROUPS[head_id]['partner'] else 1 # Agressivo vs Conservador
+                # Pull agressivo para filas primárias, conservador para stealing
+                is_primary = target_id in primary_queues
+                pull_size = SCAN_WORKERS * 2 if is_primary else 1
                 
                 try:
                     for _ in range(pull_size): 
-                        file_batch.append(queue_to_pull.get(timeout=0.001))
-                except queue.Empty:
+                        # Usando timeout=0.001 para ser o mais não-bloqueante possível
+                        file_batch.append(queue_to_pull.get(timeout=0.001)) 
+                except multiprocessing.Queue.empty:
                     pass 
                 
                 if file_batch:
@@ -1539,15 +1559,13 @@ def process_worker_multi_head(
                         future = scanner_executor.submit(engine._scan_and_hash_worker_multi_head, file_info)
                         active_scanner_futures.add(future)
                         
-                    time.sleep(0.01) # Pequeno descanso após submeter lote
+                    time.sleep(0.01) 
                 
-                # Se chegamos aqui e o target_id ainda é válido, tentamos novamente imediatamente (Small sleep)
                 time.sleep(0.05)
 
 
-            # --- 4. SHUTDOWN SEQUENCE (Espera pelo Upload Assíncrono) ---
+            # --- 5. SHUTDOWN SEQUENCE (Espera pelo Upload Assíncrono) ---
             
-            # Garante que todos os scanners terminaram e a fila interna de chunks foi totalmente alimentada
             scanner_executor.shutdown(wait=True)
             engine._safe_print("[info]Scanners desligados. Aguardando conclusão de uploads remanescentes...[/info]")
             
@@ -1561,7 +1579,6 @@ def process_worker_multi_head(
                     engine._safe_print(f"[alert]Tempo de espera ({MAX_IDLE_CYCLES_UPLOAD_WAIT}s) excedido para Uploads e MPU Completion. Forçando finalização dos MPUs abertos.[/alert]", style=None)
                     break
                     
-                # Update progress description during cleanup phase
                 progress.update(overall_task, description=f"[bold magenta]Fase 3: Limpeza/Aguardando Uploads ({len(engine.mpu_state)} MPUs restantes)...[/bold magenta]")
 
             
@@ -1579,23 +1596,25 @@ def process_worker_multi_head(
             for _ in range(worker_count):
                 engine.upload_queue.put(None)
             
-            uploader_executor.shutdown(wait=False)
+            # Usar wait=True aqui é seguro pois o pool de threads do S3 é puramente I/O (libera o GIL)
+            uploader_executor.shutdown(wait=True) 
 
-        # 5. Coleta de Métricas
+        # 6. Coleta de Métricas
         local_metrics = engine.metrics
         local_non_uploaded = engine.log_db.get_run_metrics() 
         
         for key, count in local_metrics.items():
-            global_metrics_dict[f'H{head_id}_{key}'] = count
+            global_metrics_dict[f'P{head_id}_{key}'] = count
         
         global_non_uploaded_list.extend(local_non_uploaded)
                     
     except Exception as e:
         safe_error = str(e).encode('utf-8', 'ignore').decode('utf-8')
+        process_name = f"P{head_id}"
         if engine and hasattr(engine, '_safe_print'):
-             engine._safe_print(Panel(f"[bold red]ERRO CRÍTICO NO PROCESSO {head_id}: [/bold red]{type(e).__name__}: {safe_error}", title="Falha no Processo", border_style="red"), style=None)
+             engine._safe_print(Panel(f"[bold red]ERRO CRÍTICO NO PROCESSO {process_name}: [/bold red]{type(e).__name__}: {safe_error}", title="Falha no Processo", border_style="red"), style=None)
         else:
-             local_console.print(Panel(f"[bold red]ERRO CRÍTICO NO PROCESSO {head_id}: [/bold red]{type(e).__name__}: {safe_error}", title="Falha no Processo", border_style="red"))
+             local_console.print(Panel(f"[bold red]ERRO CRÍTICO NO PROCESSO {process_name}: [/bold red]{type(e).__name__}: {safe_error}", title="Falha no Processo", border_style="red"))
     finally:
         if engine and hasattr(engine, 'log_db'):
             try:
@@ -1607,7 +1626,7 @@ def process_worker_multi_head(
 
 if __name__ == "__main__":
     os.system('cls' if os.name == 'nt' else 'clear')
-    console.print(Panel.fit("[bold white on magenta] MEGA CRYPTO HASH UPLOADER (V23.0.1 - FLUXO HÍBRIDO 8x20 OTIMIZADO) [/bold white on magenta]", border_style="magenta"))
+    console.print(Panel.fit("[bold white on magenta] MEGA CRYPTO HASH UPLOADER (V24.0.1 - FLUXO HÍBRIDO 8+4 OTIMIZADO) [/bold white on magenta]", border_style="magenta"))
     
     target_folder = None
     collection_name = None
@@ -1713,35 +1732,52 @@ if __name__ == "__main__":
             sys.exit(0)
             
         manager = Manager()
-        # Criando 16 filas lógicas (H1 a H16)
-        head_queues: Dict[int, MPQueue] = {i: manager.Queue() for i in range(1, 16 + 1)}
+        # CORREÇÃO: Usando multiprocessing.Queue() nativa para as filas de dados (Q1-Q16)
+        head_queues: Dict[int, multiprocessing.Queue] = {i: multiprocessing.Queue() for i in range(1, 16 + 1)}
         
-        console.print(f"[info]⚙️ Iniciando Orquestração Hierárquica e Alocação (Total de 16 Filas Lógicas mapeadas em {NUM_PROCESSES} Heads)...[/info]")
+        console.print(f"[info]⚙️ Iniciando Orquestração Hierárquica e Alocação (Total de 16 Filas Lógicas mapeadas em {NUM_TOTAL_PROCESSES} Processos)...[/info]")
         
         orchestration_metrics, group_report = orchestrate_and_queue_hierarchical(
             file_groups, 
             head_queues
         )
         
-        console.print("\n--- Distribuição Final (V23.0.1 Otimizada) ---")
+        console.print("\n--- Distribuição Final (V24.0.1 Otimizada) ---")
         console.print(f"Total de Arquivos Alocados: [bold green]{orchestration_metrics['total_files_allocated']}[/bold green]")
         console.print(f"Total de Dados Alocados: [bold cyan]{humanize.naturalsize(orchestration_metrics['total_size_allocated'])}[/bold cyan]")
-        console.print(f"Heads de Processamento Ativos: [bold yellow]{NUM_PROCESSES} PROCESSOS[/bold yellow]")
-        console.print(f"Total de Upload Workers: {TOTAL_UPLOAD_WORKERS} (Cada Head possui {WORKERS_PER_HEAD} workers)")
+        console.print(f"Heads de Processamento Ativos: [bold yellow]{NUM_PROCESSES_LARGE} LARGE + {NUM_PROCESSES_SMALL} SMALL Processos[/bold yellow]")
+        console.print(f"Total de Upload Workers: {TOTAL_UPLOAD_WORKERS} (Com Semáforo de I/O de Disco de 4x por Processo)")
         console.print("--------------------------\n")
         
-        # 4. Inicia Processos (1 a 8)
+        # 4. Inicia Processos (1 a 8 - LARGE Pool, 9 a 12 - SMALL Pool)
         processes = []
         global_metrics = manager.dict() 
         global_non_uploaded = manager.list() 
         
-        for i in range(1, NUM_PROCESSES + 1):
-            
-            # Pega as filas que este processo deve consumir (ex: H1 -> [1, 9])
+        # Processos Large (P1-P8)
+        for i in range(1, NUM_PROCESSES_LARGE + 1):
             my_queue_ids = PROCESS_QUEUE_MAP[i]
-            
             p = Process(target=process_worker_multi_head, args=(
                 i, 
+                collection_name, 
+                target_folder, 
+                password, 
+                head_queues, 
+                my_queue_ids,
+                global_metrics,
+                global_non_uploaded,
+            ))
+            processes.append(p)
+            p.start()
+            
+        # Processos Small (P9-P12)
+        for i in range(1, NUM_PROCESSES_SMALL + 1):
+            process_id = NUM_PROCESSES_LARGE + i # P9, P10, P11, P12
+            # Usa o mapeamento de filas Small
+            my_queue_ids = PROCESS_QUEUE_MAP_SMALL[i + 8] 
+            
+            p = Process(target=process_worker_multi_head, args=(
+                process_id, # Passa o ID P9-P12
                 collection_name, 
                 target_folder, 
                 password, 
@@ -1759,9 +1795,9 @@ if __name__ == "__main__":
 
         # 5. Agregação final (Lendo o DB para métricas finais globais)
         
-        total_uploaded = sum(global_metrics.get(f'H{i}_uploaded', 0) for i in range(1, NUM_PROCESSES + 1))
-        total_failed = sum(global_metrics.get(f'H{i}_failed', 0) for i in range(1, NUM_PROCESSES + 1))
-        total_ignored_worker = sum(global_metrics.get(f'H{i}_ignored', 0) for i in range(1, NUM_PROCESSES + 1))
+        total_uploaded = sum(global_metrics.get(f'P{i}_uploaded', 0) for i in range(1, NUM_TOTAL_PROCESSES + 1))
+        total_failed = sum(global_metrics.get(f'P{i}_failed', 0) for i in range(1, NUM_TOTAL_PROCESSES + 1))
+        total_ignored_worker = sum(global_metrics.get(f'P{i}_ignored', 0) for i in range(1, NUM_TOTAL_PROCESSES + 1))
         
         final_metrics = {
             'uploaded': total_uploaded + ignored_by_continuation,
@@ -1791,7 +1827,7 @@ if __name__ == "__main__":
         )
         
         final_panel_content = (
-            f"[bold green]OPERAÇÃO GLOBAL FINALIZADA! ({NUM_PROCESSES} HEADS)[/bold green]\n\n"
+            f"[bold green]OPERAÇÃO GLOBAL FINALIZADA! ({NUM_TOTAL_PROCESSES} PROCESSOS)[/bold green]\n\n"
             f"📦 Coleção: [cyan]{collection_name}[/cyan]\n"
             f"✅ Uploads Concluídos: [success]{final_metrics['uploaded']}[/success]\n"
             f"🚫 Arquivos Ignorados: [warning]{final_metrics['ignored']}[/warning]\n"
@@ -1809,3 +1845,5 @@ if __name__ == "__main__":
         
     console.print("\n[bold magenta]*** FIM DA SESSÃO ***[/bold magenta]")
     input("Pressione ENTER para fechar...")
+
+# --- END OF FILE Paste January 25, 2026 - 11:15PM (V24.0.1) ---
