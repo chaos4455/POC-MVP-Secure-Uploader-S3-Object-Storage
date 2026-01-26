@@ -47,15 +47,15 @@ SCAN_WORKERS = 8
 NUM_PROCESSES = 8 # AJUSTADO PARA 8 Motores Processuais
 
 # Workers/Threads ALOCADOS DENTRO DE CADA UM DOS 8 PROCESSOS (H1 a H8):
-LARGE_UPLOAD_WORKERS = 30   # Para arquivos > 10MB (Aumentado de 10 para 15)
-SMALL_UPLOAD_WORKERS = 10    # Para arquivos <= 10MB (Aumentado de 4 para 5)
+LARGE_UPLOAD_WORKERS = 36   # Para arquivos > 10MB (Aumentado de 10 para 15)
+SMALL_UPLOAD_WORKERS = 14    # Para arquivos <= 10MB (Aumentado de 4 para 5)
 
 WORKERS_PER_HEAD = LARGE_UPLOAD_WORKERS + SMALL_UPLOAD_WORKERS # 15 + 5 = 20 Upload Workers por Head
 TOTAL_UPLOAD_WORKERS = NUM_PROCESSES * WORKERS_PER_HEAD # 8 * 20 = 160 (Aumentado de 56 para 160)
 
 # 20 + 8 + 10 = 38
-MAX_POOL_CONNECTIONS = WORKERS_PER_HEAD + SCAN_WORKERS + 10 # Aumentado para 38
-MAX_THREADS = 60 # Aumentado para acomodar o pool local + overhead da S3 Config
+MAX_POOL_CONNECTIONS = WORKERS_PER_HEAD + SCAN_WORKERS + 200 # Aumentado para 38
+MAX_THREADS = 100 # Aumentado para acomodar o pool local + overhead da S3 Config
 
 MPU_PART_SIZE = 8 * 1024 * 1024 
 CHUNK_SIZE = MPU_PART_SIZE 
