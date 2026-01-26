@@ -65,7 +65,7 @@ TOTAL_UPLOAD_WORKERS = (NUM_PROCESSES_LARGE * WORKERS_PER_HEAD_LARGE) + (NUM_PRO
 # Max Connections: Deve acomodar todos os workers + overhead
 MAX_POOL_CONNECTIONS = TOTAL_UPLOAD_WORKERS + (NUM_TOTAL_PROCESSES * SCAN_WORKERS) + 50 
 
-MPU_PART_SIZE = 8 * 1024 * 1024 # Aumentado de 8MB para 32MB para reduzir overhead de request
+MPU_PART_SIZE = 32 * 1024 * 1024 # Aumentado de 8MB para 32MB para reduzir overhead de request
 CHUNK_SIZE = MPU_PART_SIZE 
 
 NONCE_SIZE = 8 
